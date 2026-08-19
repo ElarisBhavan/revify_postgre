@@ -255,7 +255,6 @@ img.logo-mark{width:34px;height:34px;object-fit:contain;display:block;
       <p class="err" id="me3"></p>
       <button class="go" id="enrolBtn"><span class="lbl">Confirm and finish</span>
         <svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><span class="spin"></span></button>
-      <button class="ghost" id="skipMfa">Skip for now — set it up later</button>
     </div>
 
 
@@ -354,14 +353,24 @@ img.logo-mark{width:34px;height:34px;object-fit:contain;display:block;
     busy(btn,false);
 
     if(res.mustChange){
-      pending=res.id;
+      /* The PostgreSQL backend returns a signed first-password challenge.
+         Keep the challenge, not the database account id, because the
+         /api/auth?action=first-password endpoint verifies the signature. */
+      pending=res.challenge;
       $('cpSub').textContent='Welcome, '+(res.name||res.username)+'. This account is using a temporary password — set your own before continuing.';
       step(5);return;
     }
     if(res.mfaRequired){
-      pending=res.id;
+      /* The PostgreSQL backend returns a signed MFA challenge. */
+      pending=res.challenge;
       $('mfaSub').textContent='Signed in as '+(res.name||u.value)+'. Enter the six-digit code from your authenticator app.';
       step(2);return;
+    }
+    if(res.mfaEnrol){
+      /* First-time MFA enrollment also uses a signed challenge. */
+      pending=res.challenge;
+      showQr(res.secret,res.otpauth,'qr','secretText');
+      step(3);return;
     }
     if(res.ok&&res.account){land(res.account);return;}
 
@@ -377,11 +386,33 @@ img.logo-mark{width:34px;height:34px;object-fit:contain;display:block;
     if(a.length<10){showErr($('npe'),'Use at least 10 characters.');$('np1').focus();return;}
     if(a!==b){showErr($('npe'),'Those passwords do not match.');$('np2').focus();return;}
     busy(this,true);
-    var res=await RFStore.changePassword(pending,a);
+    /* Do not use RFStore.changePassword() here: its current API-driver
+       implementation is still the old local IndexedDB path. The PostgreSQL
+       backend expects the signed challenge at /api/auth?action=first-password. */
+    var res={};
+    try{
+      var r=await fetch('/api/auth?action=first-password',{
+        method:'POST',
+        credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({challenge:pending,password:a})
+      });
+      try{res=await r.json();}catch(e){res={};}
+    }catch(e){
+      res={error:'network',message:'Could not reach the authentication server. Please try again.'};
+    }
     busy(this,false);
-    if(res.error){showErr($('npe'),res.message||'Could not update the password.');return;}
-    showQr(res.secret,res.otpauth,'qr','secretText');
-    step(3);
+    if(!res.ok && !res.mfaEnrol){
+      showErr($('npe'),res.message||'Could not update the password.');
+      return;
+    }
+    if(res.mfaEnrol){
+      pending=res.challenge;
+      showQr(res.secret,res.otpauth,'qr','secretText');
+      step(3);
+      return;
+    }
+    showErr($('npe'),'Password updated, but MFA enrollment was not returned by the server. Please restart sign-in.');
   });
 
   /* ── 6-digit inputs ── */
@@ -427,10 +458,6 @@ img.logo-mark{width:34px;height:34px;object-fit:contain;display:block;
     busy(this,false);
     if(res.ok&&res.account){land(res.account);return;}
     showErr($('me3'),res.message||'That code is not valid.');c2.clear();
-  });
-  $('skipMfa').addEventListener('click',async function(){
-    var res=await RFStore.skipMfa(pending);
-    if(res.ok&&res.account)land(res.account);
   });
   $('mfaBack').addEventListener('click',function(){c1.clear();step(1);});
 
@@ -491,8 +518,8 @@ img.logo-mark{width:34px;height:34px;object-fit:contain;display:block;
     if(raw){
       sessionStorage.removeItem('rf_pending');
       var h={};try{h=JSON.parse(raw);}catch(e){}
-      if(h.id){
-        pending=h.id;
+      if(h.challenge || h.id){
+        pending=h.challenge || h.id;
         if(h.mode==='change'){
           $('cpSub').textContent='Welcome, '+(h.name||'')+'. This account is using a temporary password \u2014 set your own before continuing.';
           step(5);
